@@ -22,7 +22,7 @@ The Replication Validation Tool for S3 (RVT-S3) enables users to continuously ve
 
 In traditional storage systems with replication features, destination storage is typically read-only. However, [Amazon Simple Storage Service (Amazon S3) Replication](https://aws.amazon.com/s3/features/replication/) is an elastic, fully managed, low-cost feature that offers more flexibility. While Amazon S3 Replication rules verify that new objects in scope are replicated to one or more destination Amazon S3 buckets, permissions on these destination buckets control access in the usual manner. This means it's possible to delete, overwrite, or create new objects in the destination if permissions allow. Additionally, permanent deletions (`DeleteObjectVersion` requests) in the source bucket are not propagated, nor are some delete markers. These characteristics can lead to inconsistencies between source and destination buckets, creating unique challenges for maintaining data integrity and compliance.
 
-RVT-S3 addresses these challenges by comparing object properties across bucket pairs, and generating detailed reports on any differences. By validating that the current versions of objects in both locations are identical, RVT-S3 gives you confidence that your replica bucket is a true and complete copy of your source data, and helps verify your replication strategy meets both operational and compliance requirements. **It does this at a very low [cost](#charges) of approximately $0.06 per month per million objects in scope.**
+RVT-S3 addresses these challenges by comparing object properties across bucket pairs, and generating detailed reports on any differences. By validating that the current versions of objects in both locations are identical, RVT-S3 gives you confidence that your replica bucket is a true and complete copy of your source data, and helps verify your replication strategy meets both operational and compliance requirements. **It does this at a very low [cost](#charges) of approximately $0.06 per month per million objects in scope plus $0.06 for CloudWatch metrics.**
 
 **Object Comparison Logic**: RVT-S3 determines object synchronization by comparing both ETag and Last Modified Time between source and destination buckets. Objects are considered synchronized when they have matching object keys, identical ETags, and identical last modified timestamps. Objects with `PENDING` replication status are automatically excluded from reports until replication completes.
 
@@ -628,7 +628,7 @@ Objects in the destination bucket that are not present in the source bucket can 
 
 
 ## Charges
-This solution uses several AWS services, each with its own pricing model. However, for workloads with fewer than 1 million objects, key components like Lambda (1M free requests/month), Step Functions (4,000 free state transitions/month), and SNS (1,000 free notifications/month) fall within AWS Free Tier limits, resulting in minimal to no costs for smaller deployments. Scaling the example below results in a **total cost of approximately $0.06 per month per million objects in scope.**
+This solution uses several AWS services, each with its own pricing model. However, for workloads with fewer than 1 million objects, key components like Lambda (1M free requests/month), Step Functions (4,000 free state transitions/month), and SNS (1,000 free notifications/month) fall within AWS Free Tier limits, resulting in minimal to no costs for smaller deployments. Scaling the example below results in a **total cost of approximately $0.06 per month per million objects in scope plus $0.06 for CloudWatch metrics.**
 
 ### Fully Costed Example
 
@@ -645,6 +645,7 @@ Example solution: Origin bucket (**1.5 Billion objects**) in eu-west-1 and Desti
 | AWS Step Functions | $0.00 | Cost for flow orchestration |
 | EventBridge | $0.00 | Cost for events |
 | SNS | $0.00 | Cost for notifications |
+| Cloudwatch | $0.002 | Cost for custom metrics |
 | **Total** | **$2.30** |
 
 **Note:** Storage costs for S3 inventory reports *are* included in this cost breakdown. These costs are minimized through lifecycle expiry rules in the centralized inventory and bypass buckets, which do not have S3 Versioning enabled. The bypass buckets expire objects after 1 day, while the centralised inventory bucket expires objects after the period defined during deployment (default 7 days).
@@ -661,6 +662,7 @@ These costs can be expected to scale approximately linearly with object count. A
 - [AWS Step Functions](https://aws.amazon.com/step-functions/)
 - [Amazon Simple Notification Service (SNS)](https://aws.amazon.com/sns/)
 - [AWS Identity and Access Management (IAM)](https://aws.amazon.com/iam/)
+- [Amazon CloudWatch](https://aws.amazon.com/cloudwatch/)
 
 ## Cleaning Up
 
