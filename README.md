@@ -650,7 +650,7 @@ Example solution: Origin bucket (**1.5 Billion objects**) in eu-west-1 and Desti
 
 **Note:** Storage costs for S3 inventory reports *are* included in this cost breakdown. These costs are minimized through lifecycle expiry rules in the centralized inventory and bypass buckets, which do not have S3 Versioning enabled. The bypass buckets expire objects after 1 day, while the centralised inventory bucket expires objects after the period defined during deployment (default 7 days).
 
-These costs can be expected to scale approximately linearly with object count. Adjust the cross-region data transfer cost estimate depending on your architecture choice.
+These costs (excluding CloudWatch) can be expected to scale approximately linearly with object count. Adjust the cross-region data transfer cost estimate depending on your architecture choice.
 
 
 ### Full list of AWS services Used
