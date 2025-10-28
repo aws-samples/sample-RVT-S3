@@ -1,4 +1,4 @@
-# Amazon S3 Replication Validation Tool (S3-RVT)
+# Replication Validation Tool for Amazon S3 (RVT-S3)
 
 ## Table of Contents
 
