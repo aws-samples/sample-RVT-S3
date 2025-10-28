@@ -1,0 +1,337 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RVT Destination Account Infrastructure - Bypass Bucket and Inventory Setup'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Project name used as prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Project name must contain only lowercase letters, numbers, and hyphens'
+    Default: "rvt-my-project-name"
+  
+  BypassBucketBaseName:
+    Type: String
+    Description: 'Middle part of the bypass bucket name (optional)'
+    Default: ''
+  
+  DestinationBucketName:
+    Type: String
+    Description: 'Name of the destination S3 bucket'
+  
+  CentralizeInventoryBucket:
+    Type: String
+    Description: 'Name of the centralized inventory bucket in monitoring account'
+  
+  CentralizeInventoryRegion:
+    Type: String
+    Description: 'Region of the centralized inventory bucket'
+
+  
+  DestinationBucketPrefix:
+    Type: String
+    Description: 'Optional prefix to filter objects in destination bucket inventory (leave empty for entire bucket)'
+    Default: ''
+
+Conditions:
+  HasCustomBypassBucketName: !Not [!Equals [!Ref BypassBucketBaseName, '']]
+
+Resources:
+  # S3 Bypass Bucket
+  BypassBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - HasCustomBypassBucketName
+        - !Sub '${ProjectName}-${BypassBucketBaseName}-${AWS::AccountId}-destination-bypass'
+        - !Sub '${ProjectName}-${AWS::AccountId}-destination-bypass'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'expire-inventory-after-1-day'
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpirationInDays: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'RVT-Destination-Bypass'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Replication IAM Role
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-destination-replication-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-destination-replication-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:PutBucketVersioning
+                  - s3:ListBucket
+                Resource: !GetAtt BypassBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub '${BypassBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource: !Sub 'arn:aws:s3:::${CentralizeInventoryBucket}/*'
+
+  # S3 Bucket Policy for Bypass Bucket
+  BypassBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: BypassBucket
+    Properties:
+      Bucket: !Ref BypassBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Inventory
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${BypassBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:s3:::${DestinationBucketName}'
+
+  # Lambda IAM Role
+  InventoryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-destination-inventory-setup-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-destination-inventory-setup-lambda-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutInventoryConfiguration
+                  - s3:GetInventoryConfiguration
+                  - s3:PutBucketReplication
+                  - s3:GetBucketReplication
+                  - s3:PutReplicationConfiguration
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DestinationBucketName}'
+                  - !Sub 'arn:aws:s3:::${DestinationBucketName}/*'
+                  - !GetAtt BypassBucket.Arn
+                  - !Sub '${BypassBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt ReplicationRole.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # Inventory Setup Lambda Function
+  InventorySetupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - InventoryLambdaRole
+      - BypassBucket
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rvt-destination-final-setup'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt InventoryLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationBucketName
+          BYPASS_BUCKET: !Ref BypassBucket
+          REPLICATION_ROLE_ARN: !GetAtt ReplicationRole.Arn
+          CENTRALIZE_INVENTORY_BUCKET: !Ref CentralizeInventoryBucket
+          PROJECT_NAME: !Ref ProjectName
+          DESTINATION_BUCKET_PREFIX: !Ref DestinationBucketPrefix
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import os
+          import json
+          
+          def lambda_handler(event, context):
+              # Only execute on create
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              # Get environment variables
+              destination_bucket = os.environ['DESTINATION_BUCKET']
+              bypass_bucket = os.environ['BYPASS_BUCKET']
+              replication_role_arn = os.environ['REPLICATION_ROLE_ARN']
+              centralize_inventory_bucket = os.environ['CENTRALIZE_INVENTORY_BUCKET']
+              project_name = os.environ['PROJECT_NAME']
+              
+              # Initialize S3 client
+              s3 = boto3.client('s3')
+              
+              try:
+                  # 1. Setup inventory configuration
+                  destination_inventory_config = {
+                      'Id': f'{project_name}-DestinationInventoryDaily',
+                      'Destination': {
+                          'S3BucketDestination': {
+                              'AccountId': context.invoked_function_arn.split(':')[4],
+                              'Bucket': f'arn:aws:s3:::{bypass_bucket}',
+                              'Format': 'Parquet',
+                              'Prefix': f'IR2'
+                          }
+                      },
+                      'IsEnabled': True,
+                      'IncludedObjectVersions': 'All',
+                      'Schedule': {
+                          'Frequency': 'Daily'
+                      },
+                     'OptionalFields': [
+                          'LastModifiedDate',
+                          'ETag',
+                          'ReplicationStatus'
+                      ]
+                  }
+                  
+                  # Add prefix filter if specified
+                  destination_prefix = os.environ.get('DESTINATION_BUCKET_PREFIX', '')
+                  if destination_prefix:
+                      destination_inventory_config['Filter'] = {'Prefix': destination_prefix}
+              
+                  s3.put_bucket_inventory_configuration(
+                      Bucket=destination_bucket,
+                      Id=destination_inventory_config['Id'],
+                      InventoryConfiguration=destination_inventory_config
+                  )
+                  
+                  # 2. Setup replication configuration
+                  replication_config = {
+                      'Role': replication_role_arn,
+                      'Rules': [
+                          {
+                              'ID': f'{project_name}-destination-inventory-replication',
+                              'Status': 'Enabled',
+                              'Prefix': '',
+                              'Destination': {
+                                  'Bucket': f'arn:aws:s3:::{centralize_inventory_bucket}',
+                                  'StorageClass': 'STANDARD'
+                              }
+                          }
+                      ]
+                  }
+                  
+                  s3.put_bucket_replication(
+                      Bucket=bypass_bucket,
+                      ReplicationConfiguration=replication_config
+                  )
+                  
+                  response_data = {
+                      'inventory_setup': 'Completed successfully',
+                      'replication_setup': 'Configured successfully'
+                  }
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f'Error creating configurations: {str(e)}')
+
+  # Auto-trigger Custom Resource for Inventory Setup
+  ExecuteInventorySetup:
+    Type: "Custom::InventorySetupFunction"
+    DependsOn:
+      - BypassBucket
+      - BypassBucketPolicy
+      - ReplicationRole
+      - InventoryLambdaRole
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt InventorySetupFunction.Arn
+      DestinationBucket: !Ref DestinationBucketName
+      BypassBucket: !Ref BypassBucket
+      CentralizeInventoryBucket: !Ref CentralizeInventoryBucket
+      ProjectName: !Ref ProjectName
+      DestinationBucketPrefix: !Ref DestinationBucketPrefix
+
+Outputs:
+  # Core Resources
+  BypassBucketName:
+    Description: 'Name of the destination bypass bucket created'
+    Value: !Ref BypassBucket
+  
+  # Lambda Function
+  InventorySetupFunctionName:
+    Description: 'Name of the destination inventory setup Lambda function'
+    Value: !Ref InventorySetupFunction
+  
+  # Setup Execution Status
+  InventorySetupStatus:
+    Description: 'Status of the destination inventory setup execution'
+    Value: !GetAtt ExecuteInventorySetup.inventory_setup
+  
+  ReplicationSetupStatus:
+    Description: 'Status of the destination replication setup execution'
+    Value: !GetAtt ExecuteInventorySetup.replication_setup
+  
+  # S3 Bucket Policy for Monitoring Account
+  CentralizedInventoryBucketPolicy:
+    Description: 'Policy statement to add to monitoring account centralized inventory bucket (COPY THIS TO MONITORING ACCOUNT BUCKET POLICY)'
+    Value: !Sub |
+      {
+        "Sid": "AllowDestinationReplication",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "${ReplicationRole.Arn}"
+        },
+        "Action": [
+          "s3:ReplicateObject",
+          "s3:ReplicateDelete",
+          "s3:GetBucketVersioning",
+          "s3:PutBucketVersioning"
+        ],
+        "Resource": [
+          "arn:aws:s3:::${CentralizeInventoryBucket}",
+          "arn:aws:s3:::${CentralizeInventoryBucket}/*"
+        ]
+      }

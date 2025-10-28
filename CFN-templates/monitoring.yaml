@@ -1,0 +1,1796 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RVT Monitoring Account Infrastructure - Centralized Processing and Validation'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Project name used as prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Project name must contain only lowercase letters, numbers, and hyphens'
+    Default: "rvt-my-project-name"
+  
+  BucketName:
+    Type: String
+    Description: 'Name of the centralized inventory S3 bucket (optional)'
+    Default: ''
+  
+  SourceBucketName:
+    Type: String
+    Description: 'Name of the source S3 bucket'
+  
+  DestinationBucketName:
+    Type: String
+    Description: 'Name of the destination S3 bucket'
+  
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for RVT notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+    Default: ''
+  
+  SlackWebhookUrl:
+    Type: String
+    Description: 'Slack webhook URL for RVT notifications (optional)'
+    Default: ''
+    NoEcho: true
+    AllowedPattern: '^$|^https://hooks\.slack\.com/triggers/.*'
+    ConstraintDescription: 'Slack webhook URL must start with https://hooks.slack.com/triggers/ or be empty'
+    
+  RetentionDays:
+    Type: Number
+    Description: 'Number of days to retain inventory data (1-365)'
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+
+Rules:
+  RequireNotificationMethod:
+    Assertions:
+      - Assert: !Or [!Not [!Equals [!Ref NotificationEmail, '']], !Not [!Equals [!Ref SlackWebhookUrl, '']]]
+        AssertDescription: 'At least one notification method (email or Slack webhook) must be provided'
+
+Conditions:
+  HasCustomBucketName: !Not [!Equals [!Ref BucketName, '']]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+
+Resources:
+  # S3 Bucket - Central Inventory Bucket
+  RVTBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - HasCustomBucketName
+        - !Ref BucketName
+        - !Sub '${ProjectName}-rvt-inventory-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub 'expire-ir1-after-${RetentionDays}-days'
+            Status: Enabled
+            Prefix: IR1
+            ExpirationInDays: !Ref RetentionDays
+            NoncurrentVersionExpirationInDays: !Ref RetentionDays
+          - Id: !Sub 'expire-ir2-after-${RetentionDays}-days'
+            Status: Enabled
+            Prefix: IR2
+            ExpirationInDays: !Ref RetentionDays
+            NoncurrentVersionExpirationInDays: !Ref RetentionDays
+          - Id: !Sub 'expire-athena-queries-after-${RetentionDays}-days'
+            Status: Enabled
+            Prefix: athena_queries
+            ExpirationInDays: !Ref RetentionDays
+            NoncurrentVersionExpirationInDays: !Ref RetentionDays
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'RVT-Monitoring'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket Policy
+  InventoryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: 
+      - RVTBucket
+      - StepFunctionRole
+    Properties:
+      Bucket: !Ref RVTBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowStepFunctionAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt StepFunctionRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt RVTBucket.Arn
+              - !Sub '${RVTBucket.Arn}/*'
+
+  # SNS Topic
+  RVTNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-rvt-notification-topic'
+      DisplayName: !Sub '${ProjectName} RVT Notifications'
+  
+  # SNS Email Subscription (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref RVTNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # SNS Slack Subscription (conditional)
+  SlackSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasSlackWebhook
+    Properties:
+      Protocol: https
+      TopicArn: !Ref RVTNotificationTopic
+      Endpoint: !Ref SlackWebhookUrl
+
+  # Athena Workgroup
+  RVTWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-rvt-workgroup'
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: False
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${RVTBucket}/athena_queries/'
+
+  # Lambda Permission for S3 to invoke symlink modifier
+  SymlinkModifierPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SymlinkModifierFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RVTBucket.Arn
+
+  # Symlink Modifier Lambda Function
+  SymlinkModifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-symlink-modifier'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SymlinkModifierRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref RVTBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import re
+          from urllib.parse import unquote
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              target_bucket = os.environ['TARGET_BUCKET']
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = unquote(event['Records'][0]['s3']['object']['key'])
+              
+              if key.endswith('/symlink.txt'):
+                  try:
+                      response = s3.head_object(Bucket=bucket, Key=key)
+                      if response.get('Metadata', {}).get('processed') == 'true':
+                          return
+                      
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content = response['Body'].read().decode('utf-8')
+                      
+                      modified_content = re.sub(
+                          r's3://[^/]+/',
+                          f's3://{target_bucket}/',
+                          content.strip()
+                      )
+                      
+                      s3.put_object(
+                          Bucket=bucket, 
+                          Key=key, 
+                          Body=modified_content,
+                          ContentType='text/plain',
+                          Metadata={'processed': 'true'}
+                      )
+                  except Exception as e:
+                      print(f"Error processing {key}: {str(e)}")
+
+  # Symlink Modifier IAM Role
+  SymlinkModifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-symlink-modifier-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-symlink-modifier-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:HeadObject
+                Resource: 
+                  - !Sub '${RVTBucket.Arn}/IR1/*'
+                  - !Sub '${RVTBucket.Arn}/IR2/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # RVT Setup Lambda Function
+  RVTSetupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - RVTBucket
+      - SymlinkModifierFunction
+      - SymlinkModifierPermission
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rvt-setup'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt RVTSetupRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucketName
+          DESTINATION_BUCKET: !Ref DestinationBucketName
+          INVENTORY_BUCKET: !Ref RVTBucket
+          ATHENA_WORKGROUP_NAME: !Ref RVTWorkgroup
+          PROJECT_NAME: !Ref ProjectName
+          LAMBDA_ARN: !GetAtt SymlinkModifierFunction.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import os
+          import time
+          from datetime import datetime
+          
+          def execute_athena_query(query):
+              athena_client = boto3.client('athena')
+              bucket_name = os.environ['INVENTORY_BUCKET']
+              workgroup_name = os.environ['ATHENA_WORKGROUP_NAME']
+              
+              response = athena_client.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': 'default'},
+                  ResultConfiguration={'OutputLocation': f's3://{bucket_name}/athena_queries/'},
+                  WorkGroup=workgroup_name
+              )
+              
+              query_execution_id = response['QueryExecutionId']
+              
+              while True:
+                  response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+                  state = response['QueryExecution']['Status']['State']
+                  
+                  if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                      break
+                  time.sleep(1)
+              
+              if state == 'SUCCEEDED':
+                  return True
+              else:
+                  error_message = response['QueryExecution']['Status'].get('StateChangeReason', 'No error message available')
+                  raise Exception(f"Query failed with state {state}: {error_message}")
+          
+          def setup_s3_notification(s3_client, bucket_name, lambda_arn):
+              notification_config = {
+                  'LambdaFunctionConfigurations': [
+                      {
+                          'Id': 'SymlinkModifierNotification',
+                          'LambdaFunctionArn': lambda_arn,
+                          'Events': ['s3:ObjectCreated:*'],
+                          'Filter': {
+                              'Key': {
+                                  'FilterRules': [
+                                      {
+                                          'Name': 'suffix',
+                                          'Value': 'symlink.txt'
+                                      }
+                                  ]
+                              }
+                          }
+                      }
+                  ]
+              }
+              
+              try:
+                  existing_config = s3_client.get_bucket_notification_configuration(Bucket=bucket_name)
+                  if 'EventBridgeConfiguration' in existing_config:
+                      notification_config['EventBridgeConfiguration'] = existing_config['EventBridgeConfiguration']
+              except s3_client.exceptions.NoSuchConfiguration:
+                  pass
+              
+              s3_client.put_bucket_notification_configuration(
+                  Bucket=bucket_name,
+                  NotificationConfiguration=notification_config
+              )
+          
+          def create_athena_tables(bucket_name, source_bucket, destination_bucket, project_name):
+              project_name_underscored = project_name.replace('-', '_')
+              ir1_table_name = f"{project_name_underscored}_rvt_ir1_table"
+              ir2_table_name = f"{project_name_underscored}_rvt_ir2_table"
+              
+              current_date = datetime.now().strftime('%Y-%m-%d-01-00')
+              projection_range = f"{current_date},NOW"
+              
+              create_ir1_table_query = f"""
+              CREATE EXTERNAL TABLE {ir1_table_name}(
+                  bucket string, key string, version_id string, is_latest boolean,
+                  is_delete_marker boolean, last_modified_date timestamp,
+                  e_tag string, replication_status string
+              ) 
+              PARTITIONED BY (dt string)
+              ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+              STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat'
+              OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
+              LOCATION 's3://{bucket_name}/IR1/{source_bucket}/{project_name}-SourceInventoryDaily/hive/'
+              TBLPROPERTIES (
+                  "projection.enabled" = "true",
+                  "projection.dt.type" = "date",
+                  "projection.dt.format" = "yyyy-MM-dd-HH-mm",
+                  "projection.dt.range" = "{projection_range}",
+                  "projection.dt.interval" = "1",
+                  "projection.dt.interval.unit" = "HOURS"
+              )
+              """
+              
+              create_ir2_table_query = f"""
+              CREATE EXTERNAL TABLE {ir2_table_name}(
+                  bucket string, key string, version_id string, is_latest boolean,
+                  is_delete_marker boolean, last_modified_date timestamp,
+                  e_tag string, replication_status string
+              ) 
+              PARTITIONED BY (dt string)
+              ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+              STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat'
+              OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
+              LOCATION 's3://{bucket_name}/IR2/{destination_bucket}/{project_name}-DestinationInventoryDaily/hive/'
+              TBLPROPERTIES (
+                  "projection.enabled" = "true",
+                  "projection.dt.type" = "date",
+                  "projection.dt.format" = "yyyy-MM-dd-HH-mm",
+                  "projection.dt.range" = "{projection_range}",
+                  "projection.dt.interval" = "1",
+                  "projection.dt.interval.unit" = "HOURS"
+              )
+              """
+              
+              results = {'ir1_table': None, 'ir2_table': None, 'errors': []}
+              
+              try:
+                  execute_athena_query(create_ir1_table_query)
+                  results['ir1_table'] = 'Created successfully'
+              except Exception as e:
+                  results['errors'].append(f'Error creating IR1 table: {str(e)}')
+                  results['ir1_table'] = 'Failed'
+              
+              try:
+                  execute_athena_query(create_ir2_table_query)
+                  results['ir2_table'] = 'Created successfully'
+              except Exception as e:
+                  results['errors'].append(f'Error creating IR2 table: {str(e)}')
+                  results['ir2_table'] = 'Failed'
+              
+              return results
+          
+          def create_filter_template(s3_client, inventory_bucket):
+              filter_content = "bucket_name,object_key,version_id\n"
+              
+              try:
+                  s3_client.put_object(
+                      Bucket=inventory_bucket,
+                      Key='filter-list/filter-list.csv',
+                      Body=filter_content,
+                      ContentType='text/csv'
+                  )
+                  return 'Created successfully'
+              except Exception as e:
+                  return f'Failed: {str(e)}'
+          
+          def lambda_handler(event, context):
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              try:
+                  source_bucket = os.environ['SOURCE_BUCKET']
+                  destination_bucket = os.environ['DESTINATION_BUCKET']
+                  inventory_bucket = os.environ['INVENTORY_BUCKET']
+                  project_name = os.environ['PROJECT_NAME']
+                  lambda_arn = os.environ['LAMBDA_ARN']
+                  
+                  s3 = boto3.client('s3')
+                  
+                  # Setup S3 notification
+                  setup_s3_notification(s3, inventory_bucket, lambda_arn)
+                  
+                  # Create Athena tables
+                  table_results = create_athena_tables(inventory_bucket, source_bucket, destination_bucket, project_name)
+                  
+                  # Create filter template
+                  filter_result = create_filter_template(s3, inventory_bucket)
+                  
+                  response_data = {
+                      's3_notification': 'Configured successfully',
+                      'table_creation': table_results,
+                      'filter_template': filter_result
+                  }
+                  
+                  if table_results['errors']:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, str(table_results['errors']))
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f'Error in setup: {str(e)}')
+
+  # RVT Setup IAM Role
+  RVTSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rvt-setup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-rvt-setup-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotificationConfiguration
+                  - s3:PutBucketNotificationConfiguration
+                Resource:
+                  - !GetAtt RVTBucket.Arn
+                  - !Sub '${RVTBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: 
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${RVTWorkgroup}'
+              - Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
+
+  # Check IR2 Lambda Function
+  CheckIR2Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rvt-check-ir2'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckIR2Role.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          INVENTORY_BUCKET_NAME: !Ref RVTBucket
+          DESTINATION_BUCKET_NAME: !Ref DestinationBucketName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import re
+          from datetime import datetime, timedelta
+          import json
+          import os
+          
+          def lambda_handler(event, context):
+              print("Received event:")
+              print(json.dumps(event, indent=2))
+          
+              s3_client = boto3.client('s3')
+              
+              inventory_bucket_name = os.environ['INVENTORY_BUCKET_NAME']
+              destination_bucket = os.environ['DESTINATION_BUCKET_NAME']
+              project_name = os.environ['PROJECT_NAME']
+              
+              try:
+                  object_key = event['detail']['object']['key']
+                  print(f"Successfully extracted object key: {object_key}")
+              except KeyError as e:
+                  print(f"KeyError: {str(e)}")
+                  return {
+                      "Result": False,
+                      "dt": None,
+                      "dt_24hours_delay": None,
+                      "dt_24hours_delay_iso": None
+                  }
+              
+              # Extract date from manifest.json path: IR1/bucket/project-SourceInventoryDaily/2024-01-15T01-00Z/manifest.json
+              date_match = re.search(r'/(\d{4}-\d{2}-\d{2})T\d{2}-\d{2}Z/manifest\.json$', object_key)
+              
+              if not date_match:
+                  print("No date match found in object key")
+                  return {
+                      "Result": False,
+                      "dt": None,
+                      "dt_24hours_delay": None,
+                      "dt_24hours_delay_iso": None
+                  }
+              
+              event_date = date_match.group(1)  # Already in YYYY-MM-DD format
+              print(f"Extracted date: {event_date}")
+              
+              search_prefix = f"IR2/{destination_bucket}/{project_name}-DestinationInventoryDaily/{event_date}T"
+              print(f"Search prefix: {search_prefix}")
+              
+              response = s3_client.list_objects_v2(
+                  Bucket=inventory_bucket_name,
+                  Prefix=search_prefix
+              )
+              
+              result = False
+              if 'Contents' in response:
+                  print(f"Found {len(response['Contents'])} objects with prefix {search_prefix}")
+                  for obj in response['Contents']:
+                      key = obj['Key']
+                      print(f"Checking object: {key}")
+                      pattern = f"^IR2/{destination_bucket}/{project_name}-DestinationInventoryDaily/{event_date}T\\d{{2}}-\\d{{2}}Z/manifest\\.json$"
+                      print(f"Pattern: {pattern}")
+                      
+                      if re.match(pattern, key):
+                          print(f"Matching file found: {key}")
+                          result = True
+                          break
+              else:
+                  print(f"No objects found with prefix: {search_prefix}")
+                  # Try broader search to see what's actually there
+                  broader_response = s3_client.list_objects_v2(
+                      Bucket=inventory_bucket_name,
+                      Prefix=f"IR2/"
+                  )
+                  if 'Contents' in broader_response:
+                      print("Available IR2 objects:")
+                      for obj in broader_response['Contents'][:10]:  # Show first 10
+                          print(f"  {obj['Key']}")
+              
+              if not result:
+                  print("No matching file found")
+              
+              dt_value = f"{event_date}-01-00"
+              dt_datetime = datetime.strptime(event_date, '%Y-%m-%d')
+              
+              previous_day_timestamp = (dt_datetime - timedelta(days=1)).strftime('%Y-%m-%d 23:59:59.000')
+              previous_day_iso = (dt_datetime - timedelta(days=1)).strftime('%Y-%m-%dT23:59:59.000Z')
+              
+              return {
+                  "Result": result,
+                  "dt": dt_value,
+                  "dt_24hours_delay": previous_day_timestamp,
+                  "dt_24hours_delay_iso": previous_day_iso
+              }
+
+  # Check IR2 IAM Role
+  CheckIR2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rvt-check-ir2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-rvt-check-ir2-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RVTBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': ['IR2/*']
+
+  # Metadata Cleaner Lambda Function
+  MetadataCleanerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-metadata-cleaner'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MetadataCleanerRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          INVENTORY_BUCKET_NAME: !Ref RVTBucket
+          ATHENA_WORKGROUP_NAME: !Ref RVTWorkgroup
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import urllib.parse
+          import re
+          import time
+          
+          def lambda_handler(event, context):
+              inventory_bucket = os.environ.get('INVENTORY_BUCKET_NAME')
+              athena_workgroup = os.environ.get('ATHENA_WORKGROUP_NAME')
+              project_name = os.environ.get('PROJECT_NAME')
+              
+              s3_location = event.get('s3Location')
+              table_type = event.get('tableType')
+              
+              if not s3_location or not table_type:
+                  return {
+                      'statusCode': 400,
+                      'body': 'Missing required parameters: s3Location or tableType'
+                  }
+              
+              parsed_url = urllib.parse.urlparse(s3_location)
+              bucket_name = parsed_url.netloc
+              file_path = parsed_url.path.lstrip('/')
+              
+              directory_prefix = re.sub(r'/[^/]+\.csv$', '/', file_path)
+              if not directory_prefix.endswith('/'):
+                  directory_prefix += '/'
+              
+              s3 = boto3.client('s3')
+              
+              response = s3.list_objects_v2(Bucket=bucket_name, Prefix=directory_prefix)
+              
+              deleted_files = []
+              if 'Contents' in response:
+                  for obj in response['Contents']:
+                      key = obj['Key']
+                      if key.endswith('.csv.metadata'):
+                          s3.delete_object(Bucket=bucket_name, Key=key)
+                          deleted_files.append(key)
+              
+              directory_location = f's3://{bucket_name}/{directory_prefix}'
+              
+              project_name_underscored = project_name.replace('-', '_')
+              
+              if table_type == 'filter':
+                  table_name = f"{project_name_underscored}_filter_table"
+                  query = f"""
+                  CREATE EXTERNAL TABLE IF NOT EXISTS {table_name} (
+                      bucket_name string,
+                      object_key string,
+                      version_id string
+                  )
+                  ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+                  WITH SERDEPROPERTIES (
+                      'separatorChar' = ',',
+                      'quoteChar' = '"'
+                  )
+                  STORED AS TEXTFILE
+                  LOCATION '{directory_location}'
+                  TBLPROPERTIES (
+                      'skip.header.line.count'='1'
+                  )
+                  """
+              else:
+                  table_name = f"{project_name_underscored}_only_{table_type}_temp"
+                  query = f"""
+                  CREATE EXTERNAL TABLE {table_name} (
+                      location string,
+                      bucket string,
+                      key string,
+                      version_id string,
+                      e_tag string,
+                      last_modified_date string,
+                      replication_status string
+                  )
+                  ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+                  WITH SERDEPROPERTIES (
+                      'separatorChar' = ',',
+                      'quoteChar' = '"',
+                      'escapeChar' = '\\\\',
+                      'serialization.format' = ','
+                  )
+                  STORED AS TEXTFILE
+                  LOCATION '{directory_location}'
+                  TBLPROPERTIES (
+                      'skip.header.line.count'='1'
+                  )
+                  """
+              
+              database_name = "default"
+              
+              athena_client = boto3.client('athena')
+              
+              try:
+                  response = athena_client.start_query_execution(
+                      QueryString=query,
+                      QueryExecutionContext={
+                          'Database': database_name
+                      },
+                      ResultConfiguration={
+                          'OutputLocation': f's3://{inventory_bucket}/athena_queries/table_creation/'
+                      },
+                      WorkGroup=athena_workgroup
+                  )
+                  
+                  query_execution_id = response['QueryExecutionId']
+                  
+                  while True:
+                      query_status = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+                      status = query_status['QueryExecution']['Status']['State']
+                      
+                      if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                          break
+                          
+                      time.sleep(1)
+                  
+                  if status == 'SUCCEEDED':
+                      return {
+                          'statusCode': 200,
+                          'deletedFiles': deleted_files,
+                          's3Location': s3_location,
+                          'directoryLocation': directory_location,
+                          'tableCreationStatus': 'SUCCESS',
+                          'tableName': table_name,
+                          'database': database_name,
+                          'queryExecutionId': query_execution_id
+                      }
+                  else:
+                      error_message = query_status['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
+                      return {
+                          'statusCode': 500,
+                          'deletedFiles': deleted_files,
+                          's3Location': s3_location,
+                          'directoryLocation': directory_location,
+                          'tableCreationStatus': f'FAILED: {error_message}',
+                          'tableName': table_name,
+                          'queryExecutionId': query_execution_id
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'deletedFiles': deleted_files,
+                      's3Location': s3_location,
+                      'directoryLocation': directory_location,
+                      'tableCreationStatus': f'ERROR: {str(e)}',
+                      'tableName': table_name
+                  }
+
+  # Metadata Cleaner IAM Role
+  MetadataCleanerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-metadata-cleaner-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-metadata-cleaner-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: 
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${RVTWorkgroup}'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt RVTBucket.Arn
+                  - !Sub '${RVTBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
+
+  # Email Formatter Lambda Function
+  EmailFormatterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rvt-email-formatter'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt EmailFormatterRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          SOURCE_BUCKET_NAME: !Ref SourceBucketName
+          DESTINATION_BUCKET_NAME: !Ref DestinationBucketName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import io
+          import os
+          from datetime import datetime
+          
+          def get_count_from_csv(s3_location):
+              if not s3_location:
+                  return 0
+              s3 = boto3.client('s3')
+              parsed_url = s3_location.replace('s3://', '').split('/')
+              bucket = parsed_url[0]
+              key = '/'.join(parsed_url[1:])
+              try:
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  lines = content.strip().split('\n')
+                  if len(lines) >= 2:
+                      count_value = lines[1].strip().strip('"')
+                      return int(count_value)
+                  return 0
+              except Exception:
+                  return 0
+          
+          def read_csv_from_s3(s3_location):
+              if not s3_location:
+                  return []
+              s3 = boto3.client('s3')
+              parsed_url = s3_location.replace('s3://', '').split('/')
+              bucket = parsed_url[0]
+              key = '/'.join(parsed_url[1:])
+              try:
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  csv_reader = csv.DictReader(io.StringIO(content))
+                  return list(csv_reader)
+              except Exception:
+                  return []
+          
+          def send_metrics_to_cloudwatch(metrics, source_bucket, destination_bucket, project_name):
+              cloudwatch = boto3.client('cloudwatch')
+              namespace = f'RVT/{project_name}'
+              
+              cloudwatch.put_metric_data(
+                  Namespace=namespace,
+                  MetricData=[
+                      {'MetricName': 'RVTMetrics', 'Value': metrics['total_ir1_count'], 'Unit': 'Count',
+                       'Dimensions': [{'Name': 'RVT-MetricType', 'Value': f'Total number of current objects in {source_bucket}'}]},
+                      {'MetricName': 'RVTMetrics', 'Value': metrics['total_ir2_count'], 'Unit': 'Count',
+                       'Dimensions': [{'Name': 'RVT-MetricType', 'Value': f'Total number of current objects in {destination_bucket}'}]},
+                      {'MetricName': 'RVTMetrics', 'Value': metrics['only_source_count'], 'Unit': 'Count',
+                       'Dimensions': [{'Name': 'RVT-MetricType', 'Value': f'Objects only in {source_bucket}'}]},
+                      {'MetricName': 'RVTMetrics', 'Value': metrics['only_destination_count'], 'Unit': 'Count',
+                       'Dimensions': [{'Name': 'RVT-MetricType', 'Value': f'Objects only in {destination_bucket}'}]},
+                      {'MetricName': 'RVTMetrics', 'Value': metrics['different_version_count'], 'Unit': 'Count',
+                       'Dimensions': [{'Name': 'RVT-MetricType', 'Value': 'Objects with different version in each location'}]}
+                  ]
+              )
+          
+          def lambda_handler(event, context):
+              try:
+                  combined_data_location = event.get('combinedDataLocation', '')
+                  only_source_count_location = event.get('onlySourceCountLocation', '')
+                  only_destination_count_location = event.get('onlyDestinationCountLocation', '')
+                  different_version_count_location = event.get('differentVersionCountLocation', '')
+                  total_ir1_count_location = event.get('totalIR1CountLocation', '')
+                  total_ir2_count_location = event.get('totalIR2CountLocation', '')
+                  dt = event.get('dt', datetime.now().strftime('%Y-%m-%d'))
+                  
+                  only_source_count = get_count_from_csv(only_source_count_location)
+                  only_destination_count = get_count_from_csv(only_destination_count_location)
+                  different_version_count = get_count_from_csv(different_version_count_location)
+                  total_ir1_count = get_count_from_csv(total_ir1_count_location)
+                  total_ir2_count = get_count_from_csv(total_ir2_count_location)
+                  
+                  source_bucket_name = os.environ.get('SOURCE_BUCKET_NAME', 'source')
+                  destination_bucket_name = os.environ.get('DESTINATION_BUCKET_NAME', 'destination')
+                  project_name = os.environ.get('PROJECT_NAME', 'rvt')
+                  
+                  # Send metrics to CloudWatch
+                  metrics = {
+                      'only_source_count': only_source_count,
+                      'only_destination_count': only_destination_count,
+                      'different_version_count': different_version_count,
+                      'total_ir1_count': total_ir1_count,
+                      'total_ir2_count': total_ir2_count
+                  }
+                  send_metrics_to_cloudwatch(metrics, source_bucket_name, destination_bucket_name, project_name)
+                  
+                  total_count = only_source_count + only_destination_count + different_version_count
+                  
+                  email_body = f"RVT tool report for {dt}\n\n"
+                  email_body += f"Total number of current objects in {source_bucket_name}: {total_ir1_count}\n"
+                  email_body += f"Total number of current objects in {destination_bucket_name}: {total_ir2_count}\n\n"
+                  email_body += f"Objects only in {source_bucket_name}: {only_source_count}\n"
+                  email_body += f"Objects only in {destination_bucket_name}: {only_destination_count}\n"
+                  email_body += f"Objects with different version in each location: {different_version_count}\n\n"
+                  
+                  if total_count <= 10 and total_count > 0:
+                      try:
+                          combined_objects = read_csv_from_s3(combined_data_location)
+                          email_body += "Detailed list:\n"
+                          for i, obj in enumerate(combined_objects, 1):
+                              mismatch_type = obj.get('location', 'Unknown')
+                              key = obj.get('key', 'Unknown')
+                              version_id = obj.get('version_id', 'Unknown')
+                              bucket = obj.get('bucket', 'Unknown')
+                              email_body += f"{i}. {mismatch_type}: {key} (Bucket: {bucket}, Version: {version_id})\n"
+                      except Exception:
+                          combined_data_prefix = combined_data_location.rsplit('/', 1)[0]
+                          email_body += f"See detailed list at: {combined_data_prefix}/\n"
+                  elif total_count > 0:
+                      combined_data_prefix = combined_data_location.rsplit('/', 1)[0]
+                      # Extract bucket and prefix for console URL
+                      s3_path = combined_data_prefix.replace('s3://', '')
+                      bucket_name = s3_path.split('/')[0]
+                      prefix = '/'.join(s3_path.split('/')[1:]) + '/'
+                      console_url = f"https://s3.console.aws.amazon.com/s3/buckets/{bucket_name}?prefix={prefix}"
+                      email_body += f"See detailed list at: {combined_data_prefix}/\nDirect console link: {console_url}\n"
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': email_body,
+                      'only_source_count': only_source_count,
+                      'only_destination_count': only_destination_count,
+                      'different_version_count': different_version_count,
+                      'total_count': total_count,
+                      'dt': dt
+                  }
+              except Exception as e:
+                  return {'statusCode': 500, 'body': f"Error processing results: {str(e)}"}
+
+  # Email Formatter IAM Role
+  EmailFormatterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rvt-email-formatter-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-rvt-email-formatter-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RVTBucket.Arn
+                  - !Sub '${RVTBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Cleanup Lambda Function
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cleanup'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CleanupRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          INVENTORY_BUCKET_NAME: !Ref RVTBucket
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              try:
+                  inventory_bucket = os.environ.get('INVENTORY_BUCKET_NAME')
+                  project_name = os.environ.get('PROJECT_NAME')
+                  dt = event.get('dt')
+                  
+                  if not inventory_bucket or not project_name or not dt:
+                      return {'statusCode': 400, 'body': 'Missing required parameters'}
+                  
+                  s3 = boto3.client('s3')
+                  glue = boto3.client('glue')
+                  
+                  project_name_underscored = project_name.replace('-', '_')
+                  tables_to_delete = [
+                      f"{project_name_underscored}_only_source_temp",
+                      f"{project_name_underscored}_only_destination_temp",
+                      f"{project_name_underscored}_only_destination_curated_temp",
+                      f"{project_name_underscored}_only_held_keys_temp",
+                      f"{project_name_underscored}_only_source_above_temp",
+                      f"{project_name_underscored}_only_source_below_temp",
+                      f"{project_name_underscored}_only_combined_mismatches_temp",
+                      f"{project_name_underscored}_filter_table",
+                      f"{project_name_underscored}_only_filtered_mismatches_temp"
+                  ]
+                  
+                  for table_name in tables_to_delete:
+                      try:
+                          glue.get_table(DatabaseName='default', Name=table_name)
+                          glue.delete_table(DatabaseName='default', Name=table_name)
+                      except Exception:
+                          pass
+                  
+                  prefixes_to_delete = [
+                      f"athena_queries/{dt}/onlysource/",
+                      f"athena_queries/{dt}/onlydestination/",
+                      f"athena_queries/{dt}/held_keys/",
+                      f"athena_queries/{dt}/count_only_source/",
+                      f"athena_queries/{dt}/count_only_destination/",
+                      f"athena_queries/{dt}/count_different_versions/",
+                      f"athena_queries/{dt}/count_total_ir1/",
+                      f"athena_queries/{dt}/count_total_ir2/",
+                      f"athena_queries/{dt}/combined_mismatches/",
+                      f"athena_queries/table_creation/"
+                  ]
+                  
+                  for prefix in prefixes_to_delete:
+                      try:
+                          paginator = s3.get_paginator('list_objects_v2')
+                          pages = paginator.paginate(Bucket=inventory_bucket, Prefix=prefix)
+                          
+                          delete_list = []
+                          for page in pages:
+                              if 'Contents' in page:
+                                  for obj in page['Contents']:
+                                      delete_list.append({'Key': obj['Key']})
+                          
+                          if delete_list:
+                              s3.delete_objects(Bucket=inventory_bucket, Delete={'Objects': delete_list})
+                      except Exception:
+                          pass
+                  
+                  return {'statusCode': 200, 'body': 'Cleanup completed successfully'}
+                  
+              except Exception as e:
+                  return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+
+  # Cleanup IAM Role
+  CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cleanup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-cleanup-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt RVTBucket.Arn
+                  - !Sub '${RVTBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:DeleteTable
+                  - glue:GetTable
+                  - glue:GetDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
+
+  # EventBridge Rule for S3 Events
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-rvt-s3-inventory-rule'
+      Description: 'Capture S3 object creation events for inventory files'
+      EventPattern:
+        source: ['aws.s3']
+        detail-type: ['Object Created']
+        detail:
+          bucket:
+            name: [!Ref RVTBucket]
+          object:
+            key:
+              - wildcard: !Sub 'IR1/${SourceBucketName}/${ProjectName}-SourceInventoryDaily/*/manifest.json'
+      Targets:
+        - Arn: !Ref RVTStateMachine
+          Id: Send-to-RVT-Step-Function
+          RoleArn: !GetAtt EventBridgeStepFunctionRole.Arn
+
+  # EventBridge IAM Role
+  EventBridgeStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rvt-eventbridge-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-rvt-eventbridge-sfn-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref RVTStateMachine
+
+  # Step Function State Machine
+  RVTStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - CheckIR2Function
+      - MetadataCleanerFunction
+      - EmailFormatterFunction
+      - CleanupFunction
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-rvt-state-machine'
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "RVT validation workflow for cross-account monitoring",
+            "TimeoutSeconds": 86400,
+            "StartAt": "RVT-check-IR2",
+            "QueryLanguage": "JSONPath",
+            "States": {
+              "RVT-check-IR2": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${CheckIR2Function.Arn}",
+                  "Payload.$": "$"
+                },
+                "ResultSelector": {
+                  "variableIR2Checker.$": "$.Payload.Result",
+                  "dt.$": "$.Payload.dt",
+                  "dt_24hours_delay.$": "$.Payload.dt_24hours_delay",
+                  "dt_24hours_delay_iso.$": "$.Payload.dt_24hours_delay_iso"
+                },
+                "ResultPath": "$.taskResult",
+                "Next": "Job Complete?",
+                "Retry": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2,
+                  "JitterStrategy": "FULL"
+                }]
+              },
+              "Wait 10 minutes": {
+                "Type": "Wait",
+                "Seconds": 600,
+                "Next": "RVT-check-IR2"
+              },
+              "Job Complete?": {
+                "Type": "Choice",
+                "Choices": [{
+                  "Variable": "$.taskResult.variableIR2Checker",
+                  "BooleanEquals": true,
+                  "Next": "Wait 10 minutes before processing"
+                }],
+                "Default": "Wait 10 minutes"
+              },
+              "Wait 10 minutes before processing": {
+                "Type": "Wait",
+                "Seconds": 600,
+                "Next": "Initial Parallel Queries"
+              },
+              "Initial Parallel Queries": {
+                "Type": "Parallel",
+                "Branches": [
+                  {
+                    "StartAt": "Process Source Objects",
+                    "States": {
+                      "Process Source Objects": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('WITH source AS (SELECT bucket, key, version_id, e_tag, is_latest, last_modified_date, replication_status FROM {}_rvt_ir1_table WHERE dt = \\'{}\\' AND is_latest = true AND last_modified_date <= TIMESTAMP \\'{}\\'), destination AS (SELECT bucket, key, version_id, e_tag, is_latest, last_modified_date, replication_status FROM {}_rvt_ir2_table WHERE dt = \\'{}\\' AND is_latest = true AND last_modified_date <= TIMESTAMP \\'{}\\') SELECT \\'In source only\\' as location, s.bucket, s.key, s.version_id, s.e_tag, s.last_modified_date, s.replication_status FROM source s LEFT JOIN destination d ON d.key = s.key AND ((d.e_tag = s.e_tag AND d.last_modified_date = s.last_modified_date) OR (d.e_tag IS NULL AND s.e_tag IS NULL)) WHERE d.key IS NULL', '${ProjectNameUnderscored}', $.taskResult.dt, $.taskResult.dt_24hours_delay, '${ProjectNameUnderscored}', $.taskResult.dt, $.taskResult.dt_24hours_delay)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/onlysource/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.sourceAthenaResult",
+                        "ResultSelector": {
+                          "OutputLocation.$": "$.QueryExecution.ResultConfiguration.OutputLocation",
+                          "QueryExecutionId.$": "$.QueryExecution.QueryExecutionId"
+                        },
+                        "Next": "Clean Source Metadata and Create Table"
+                      },
+                      "Clean Source Metadata and Create Table": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${MetadataCleanerFunction.Arn}",
+                          "Payload": {
+                            "s3Location.$": "$.sourceAthenaResult.OutputLocation",
+                            "tableType": "source",
+                            "projectName": "${ProjectName}"
+                          }
+                        },
+                        "ResultPath": "$.sourceCleanupResult",
+                        "Next": "Source Threshold Parallel Queries"
+                      },
+                      "Source Threshold Parallel Queries": {
+                        "Type": "Parallel",
+                        "Branches": [
+                          {
+                            "StartAt": "Query Source Table Above Threshold",
+                            "States": {
+                              "Query Source Table Above Threshold": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                                "Parameters": {
+                                  "QueryString.$": "States.Format('SELECT * FROM {} WHERE (replication_status IN (\\'COMPLETED\\', \\'FAILED\\', \\'REPLICA\\') OR replication_status IS NULL)', $.sourceCleanupResult.Payload.tableName)",
+                                  "ResultConfiguration": {
+                                    "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/onlysource_curated/', $.taskResult.dt)"
+                                  },
+                                  "WorkGroup": "${RVTWorkgroupName}"
+                                },
+                                "ResultPath": "$.sourceQueryAboveThresholdResult",
+                                "Next": "Clean Source Above Threshold Metadata"
+                              },
+                              "Clean Source Above Threshold Metadata": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "Parameters": {
+                                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                                  "Payload": {
+                                    "s3Location.$": "$.sourceQueryAboveThresholdResult.QueryExecution.ResultConfiguration.OutputLocation",
+                                    "tableType": "source_above"
+                                  }
+                                },
+                                "ResultPath": "$.cleanupAboveThresholdResult",
+                                "End": true
+                              }
+                            }
+                          },
+                          {
+                            "StartAt": "Query Source Table Below Threshold",
+                            "States": {
+                              "Query Source Table Below Threshold": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                                "Parameters": {
+                                  "QueryString.$": "States.Format('SELECT * FROM {} WHERE replication_status = \\'PENDING\\'', $.sourceCleanupResult.Payload.tableName)",
+                                  "ResultConfiguration": {
+                                    "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/held_keys/', $.taskResult.dt)"
+                                  },
+                                  "WorkGroup": "${RVTWorkgroupName}"
+                                },
+                                "ResultPath": "$.sourceQueryBelowThresholdResult",
+                                "Next": "Clean Source Below Threshold Metadata"
+                              },
+                              "Clean Source Below Threshold Metadata": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "Parameters": {
+                                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                                  "Payload": {
+                                    "s3Location.$": "$.sourceQueryBelowThresholdResult.QueryExecution.ResultConfiguration.OutputLocation",
+                                    "tableType": "source_below"
+                                  }
+                                },
+                                "ResultPath": "$.cleanupBelowThresholdResult",
+                                "Next": "Create Held Keys Table"
+                              },
+                              "Create Held Keys Table": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "Parameters": {
+                                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                                  "Payload": {
+                                    "s3Location.$": "$.sourceQueryBelowThresholdResult.QueryExecution.ResultConfiguration.OutputLocation",
+                                    "tableType": "held_keys",
+                                    "projectName": "${ProjectName}"
+                                  }
+                                },
+                                "ResultPath": "$.createHeldKeysTableResult",
+                                "End": true
+                              }
+                            }
+                          }
+                        ],
+                        "ResultPath": "$.sourceThresholdResults",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Process Destination Objects",
+                    "States": {
+                      "Process Destination Objects": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('WITH source AS (SELECT bucket, key, version_id, e_tag, is_latest, last_modified_date, replication_status FROM {}_rvt_ir1_table WHERE dt = \\'{}\\' AND is_latest = true AND last_modified_date <= TIMESTAMP \\'{}\\'), destination AS (SELECT bucket, key, version_id, e_tag, is_latest, last_modified_date, replication_status FROM {}_rvt_ir2_table WHERE dt = \\'{}\\' AND is_latest = true AND last_modified_date <= TIMESTAMP \\'{}\\') SELECT \\'In destination only\\' as location, d.bucket, d.key, d.version_id, d.e_tag, d.last_modified_date, d.replication_status FROM destination d LEFT JOIN source s ON s.key = d.key AND ((s.e_tag = d.e_tag AND s.last_modified_date = d.last_modified_date) OR (s.e_tag IS NULL AND d.e_tag IS NULL)) WHERE s.key IS NULL', '${ProjectNameUnderscored}', $.taskResult.dt, $.taskResult.dt_24hours_delay, '${ProjectNameUnderscored}', $.taskResult.dt, $.taskResult.dt_24hours_delay)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/onlydestination/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.destAthenaResult",
+                        "ResultSelector": {
+                          "OutputLocation.$": "$.QueryExecution.ResultConfiguration.OutputLocation",
+                          "QueryExecutionId.$": "$.QueryExecution.QueryExecutionId"
+                        },
+                        "Next": "Clean Destination Metadata and Create Table"
+                      },
+                      "Clean Destination Metadata and Create Table": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "${MetadataCleanerFunction.Arn}",
+                          "Payload": {
+                            "s3Location.$": "$.destAthenaResult.OutputLocation",
+                            "tableType": "destination",
+                            "projectName": "${ProjectName}"
+                          }
+                        },
+                        "ResultPath": "$.destCleanupResult",
+                        "End": true
+                      }
+                    }
+                  }
+                ],
+                "ResultPath": "$.initialParallelResults",
+                "Next": "Query Destination Excluding Held Keys"
+              },
+              "Query Destination Excluding Held Keys": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                "Parameters": {
+                  "QueryString.$": "States.Format('SELECT d.* FROM {}_only_destination_temp d LEFT JOIN {}_only_held_keys_temp h ON d.key = h.key WHERE h.key IS NULL', '${ProjectNameUnderscored}', '${ProjectNameUnderscored}')",
+                  "ResultConfiguration": {
+                    "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/onlydestination_curated/', $.taskResult.dt)"
+                  },
+                  "WorkGroup": "${RVTWorkgroupName}"
+                },
+                "ResultPath": "$.destinationQueryResult",
+                "Next": "Clean Destination Query Metadata"
+              },
+              "Clean Destination Query Metadata": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                  "Payload": {
+                    "s3Location.$": "$.destinationQueryResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "tableType": "destination_curated"
+                  }
+                },
+                "ResultPath": "$.cleanupDestinationQueryResult",
+                "Next": "Combine All Mismatches"
+              },
+              "Combine All Mismatches": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                "Parameters": {
+                  "QueryString.$": "States.Format('WITH combined_data AS (SELECT \\'Source only\\' as mismatch_type, location, bucket, key, version_id, e_tag, last_modified_date FROM {}_only_source_above_temp UNION ALL SELECT \\'Destination only\\' as mismatch_type, location, bucket, key, version_id, e_tag, last_modified_date FROM {}_only_destination_curated_temp), key_counts AS (SELECT key, COUNT(DISTINCT location) as location_count FROM combined_data GROUP BY key), updated_mismatch AS (SELECT CASE WHEN kc.location_count = 2 THEN \\'different latest version\\' WHEN cd.location = \\'In source only\\' THEN \\'only in source\\' WHEN cd.location = \\'In destination only\\' THEN \\'only in destination\\' END as new_mismatch_type, cd.* FROM combined_data cd JOIN key_counts kc ON cd.key = kc.key WHERE kc.location_count = 2 OR (kc.location_count = 1 AND cd.e_tag IS NOT NULL AND cd.e_tag != \\'\\')) SELECT new_mismatch_type as mismatch_type, bucket, key, version_id, e_tag, last_modified_date FROM updated_mismatch', '${ProjectNameUnderscored}', '${ProjectNameUnderscored}')",
+                  "ResultConfiguration": {
+                    "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/combined_mismatches/', $.taskResult.dt)"
+                  },
+                  "WorkGroup": "${RVTWorkgroupName}"
+                },
+                "ResultPath": "$.combinedQueryResult",
+                "Next": "Clean Combined Results Metadata"
+              },
+              "Clean Combined Results Metadata": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                  "Payload": {
+                    "s3Location.$": "$.combinedQueryResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "tableType": "combined_mismatches"
+                  }
+                },
+                "ResultPath": "$.combinedCleanupResult",
+                "Next": "Create Filter Table"
+              },
+              "Create Filter Table": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                  "Payload": {
+                    "s3Location": "s3://${RVTBucket}/filter-list/filter-list.csv",
+                    "tableType": "filter",
+                    "projectName": "${ProjectName}"
+                  }
+                },
+                "ResultPath": "$.filterTableResult",
+                "Next": "Apply Filters"
+              },
+              "Apply Filters": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                "Parameters": {
+                  "QueryString.$": "States.Format('SELECT cm.* FROM {} cm WHERE NOT EXISTS (SELECT 1 FROM {}_filter_table ft WHERE (CASE WHEN ft.object_key LIKE \\'%/\\' THEN cm.key LIKE ft.object_key || \\'%\\' ELSE cm.key = ft.object_key END) AND (ft.version_id = \\'\\'  OR ft.version_id IS NULL OR cm.version_id = ft.version_id) AND (ft.bucket_name = \\'\\'  OR ft.bucket_name IS NULL OR cm.bucket = ft.bucket_name))', $.combinedCleanupResult.Payload.tableName, '${ProjectNameUnderscored}')",
+                  "ResultConfiguration": {
+                    "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/daily_report/', $.taskResult.dt)"
+                  },
+                  "WorkGroup": "${RVTWorkgroupName}"
+                },
+                "ResultPath": "$.filteredQueryResult",
+                "Next": "Clean Filtered Results Metadata"
+              },
+              "Clean Filtered Results Metadata": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${MetadataCleanerFunction.Arn}",
+                  "Payload": {
+                    "s3Location.$": "$.filteredQueryResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "tableType": "filtered_mismatches"
+                  }
+                },
+                "ResultPath": "$.filteredCleanupResult",
+                "Next": "Count Mismatch Types"
+              },
+              "Count Mismatch Types": {
+                "Type": "Parallel",
+                "Branches": [
+                  {
+                    "StartAt": "Count Only In Source",
+                    "States": {
+                      "Count Only In Source": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('SELECT COUNT(*) as count_objects FROM default.{} WHERE location = \\'only in source\\'', $.filteredCleanupResult.Payload.tableName)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/count_only_source/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.countOnlySourceResult",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Count Only In Destination",
+                    "States": {
+                      "Count Only In Destination": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('SELECT COUNT(*) as count_objects FROM default.{} WHERE location = \\'only in destination\\'', $.filteredCleanupResult.Payload.tableName)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/count_only_destination/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.countOnlyDestinationResult",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Count Different Versions",
+                    "States": {
+                      "Count Different Versions": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('SELECT COUNT(*) as count_objects FROM default.{} WHERE location = \\'different latest version\\'', $.filteredCleanupResult.Payload.tableName)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/count_different_versions/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.countDifferentVersionsResult",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Count Total IR1 Objects",
+                    "States": {
+                      "Count Total IR1 Objects": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('SELECT COUNT(*) as total_objects FROM {}_rvt_ir1_table WHERE dt = \\'{}\\' AND is_latest = true', '${ProjectNameUnderscored}', $.taskResult.dt)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/count_total_ir1/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.countTotalIR1Result",
+                        "End": true
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "Count Total IR2 Objects",
+                    "States": {
+                      "Count Total IR2 Objects": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                        "Parameters": {
+                          "QueryString.$": "States.Format('SELECT COUNT(*) as total_objects FROM {}_rvt_ir2_table WHERE dt = \\'{}\\' AND is_latest = true', '${ProjectNameUnderscored}', $.taskResult.dt)",
+                          "ResultConfiguration": {
+                            "OutputLocation.$": "States.Format('s3://${RVTBucket}/athena_queries/{}/count_total_ir2/', $.taskResult.dt)"
+                          },
+                          "WorkGroup": "${RVTWorkgroupName}"
+                        },
+                        "ResultPath": "$.countTotalIR2Result",
+                        "End": true
+                      }
+                    }
+                  }
+                ],
+                "ResultPath": "$.mismatchCountResults",
+                "Next": "Lambda Email Formatter"
+              },
+              "Lambda Email Formatter": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${EmailFormatterFunction.Arn}",
+                  "Payload": {
+                    "combinedDataLocation.$": "$.filteredQueryResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "onlySourceCountLocation.$": "$.mismatchCountResults[0].countOnlySourceResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "onlyDestinationCountLocation.$": "$.mismatchCountResults[1].countOnlyDestinationResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "differentVersionCountLocation.$": "$.mismatchCountResults[2].countDifferentVersionsResult.QueryExecution.ResultConfiguration.OutputLocation",
+                    "totalIR1CountLocation.$": "$.mismatchCountResults[3].countTotalIR1Result.QueryExecution.ResultConfiguration.OutputLocation",
+                    "totalIR2CountLocation.$": "$.mismatchCountResults[4].countTotalIR2Result.QueryExecution.ResultConfiguration.OutputLocation",
+                    "dt.$": "$.taskResult.dt"
+                  }
+                },
+                "ResultPath": "$.emailFormatterResult",
+                "Retry": [{
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2,
+                  "JitterStrategy": "FULL"
+                }],
+                "Next": "Send query results"
+              },
+              "Send query results": {
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${RVTNotificationTopic}",
+                  "Message.$": "$.emailFormatterResult.Payload.body",
+                  "Subject.$": "States.Format('RVT. ${ProjectName} report for {}', $.taskResult.dt)"
+                },
+                "Type": "Task",
+                "ResultPath": "$.snsResult",
+                "Next": "Cleanup Temporary Resources"
+              },
+              "Cleanup Temporary Resources": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${CleanupFunction.Arn}",
+                  "Payload": {
+                    "dt.$": "$.taskResult.dt"
+                  }
+                },
+                "ResultPath": "$.cleanupResult",
+                "End": true
+              }
+            }
+          }
+        - ProjectNameUnderscored: !Join ['_', !Split ['-', !Ref ProjectName]]
+          RVTWorkgroupName: !Ref RVTWorkgroup
+
+  # Step Function IAM Role
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rvt-step-function-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-rvt-compute-services-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CheckIR2Function.Arn
+                  - !GetAtt MetadataCleanerFunction.Arn
+                  - !GetAtt EmailFormatterFunction.Arn
+                  - !GetAtt CleanupFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref RVTNotificationTopic
+        - PolicyName: !Sub '${ProjectName}-rvt-data-services-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt RVTBucket.Arn
+                  - !Sub '${RVTBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${RVTWorkgroup}'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*'
+
+  # Auto-trigger Custom Resource for RVT Setup
+  ExecuteRVTSetup:
+    Type: "Custom::RVTSetupFunction"
+    DependsOn:
+      - RVTStateMachine
+      - S3EventRule
+      - EventBridgeStepFunctionRole
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt RVTSetupFunction.Arn
+      SourceBucket: !Ref SourceBucketName
+      DestinationBucket: !Ref DestinationBucketName
+      InventoryBucket: !Ref RVTBucket
+      ProjectName: !Ref ProjectName
+
+Outputs:
+  # Essential Configuration
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+  
+  # Centralized Inventory Bucket
+  CentralizedInventoryBucket:
+    Description: 'Name of the centralized inventory bucket'
+    Value: !Ref RVTBucket
+  
+  CentralizedInventoryRegion:
+    Description: 'Region of the centralized inventory bucket'
+    Value: !Ref AWS::Region
+  
+  # Setup Status
+  RVTSetupStatus:
+    Description: 'Status of the RVT setup execution'
+    Value: !GetAtt ExecuteRVTSetup.s3_notification
+  
+  # Bucket Configuration
+  SourceBucketName:
+    Description: 'Source bucket name configured for monitoring'
+    Value: !Ref SourceBucketName
+  
+  DestinationBucketName:
+    Description: 'Destination bucket name configured for monitoring'
+    Value: !Ref DestinationBucketName
+  
+  # Notification Configuration
+  NotificationMethods:
+    Description: 'Configured notification methods'
+    Value: !Sub
+      - 'Email: ${EmailStatus}, Slack: ${SlackStatus}'
+      - EmailStatus: !If [HasNotificationEmail, !Sub 'Enabled (${NotificationEmail})', 'Disabled']
+        SlackStatus: !If [HasSlackWebhook, 'Enabled', 'Disabled']
+  
+  # Instructions
+  NextSteps:
+    Description: 'Next steps for deployment'
+    Value: 'Deploy source.yaml and destination-new.yaml in respective accounts, then update this bucket policy with the outputs from those stacks'
