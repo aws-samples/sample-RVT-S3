@@ -1,4 +1,4 @@
-# Replication Validation Tool for Amazon S3 (RVT-S3)
+# Replication Validation Tool for S3 (RVT-S3)
 
 ## Table of Contents
 
@@ -11,22 +11,22 @@
 - [Object Filtering](#object-filtering)
 - [Accessing Daily Reports](#accessing-daily-reports)
 - [CloudWatch Metrics](#cloudwatch-metrics)
-- [S3-RVT Reporting Behaviour](#s3-rvt-reporting-behaviour)
+- [RVT-S3 Reporting Behaviour](#rvt-s3-reporting-behaviour)
 - [Remediating Mismatches](#remediating-mismatches)
 - [Charges](#charges)
 - [Cleaning Up](#cleaning-up)
 
 ## Overview
 
-The Replication Validation Tool (RVT-S3) enables users to continuously verify that two [Amazon S3](https://aws.amazon.com/s3/) buckets (or prefixes) are fully synchronized, ensuring data integrity between source and destination buckets. This solution provides a way to confirm that the data on the source is identical to the data on the destination by identifying any missing objects in either location. Daily statistics are [output](#cloudwatch-metrics) to [Amazon CloudWatch](https://aws.amazon.com/cloudwatch/), and daily [reports](#sample-validation-report) are delivered via email or Slack.
+The Replication Validation Tool for S3 (RVT-S3) enables users to continuously verify that two [Amazon S3](https://aws.amazon.com/s3/) buckets (or prefixes) are fully synchronized, ensuring data integrity between source and destination buckets. This solution provides a way to confirm that the data on the source is identical to the data on the destination by identifying any missing objects in either location. Daily statistics are [output](#cloudwatch-metrics) to [Amazon CloudWatch](https://aws.amazon.com/cloudwatch/), and daily [reports](#sample-validation-report) are delivered via email or Slack.
 
 In traditional storage systems with replication features, destination storage is typically read-only. However, [Amazon Simple Storage Service (Amazon S3) Replication](https://aws.amazon.com/s3/features/replication/) is an elastic, fully managed, low-cost feature that offers more flexibility. While Amazon S3 Replication rules verify that new objects in scope are replicated to one or more destination Amazon S3 buckets, permissions on these destination buckets control access in the usual manner. This means it's possible to delete, overwrite, or create new objects in the destination if permissions allow. Additionally, permanent deletions (`DeleteObjectVersion` requests) in the source bucket are not propagated, nor are some delete markers. These characteristics can lead to inconsistencies between source and destination buckets, creating unique challenges for maintaining data integrity and compliance.
 
-S3-RVT addresses these challenges by comparing object properties across bucket pairs, and generating detailed reports on any differences. By validating that the current versions of objects in both locations are identical, S3-RVT gives you confidence that your replica bucket is a true and complete copy of your source data, and helps verify your replication strategy meets both operational and compliance requirements. **It does this at a very low [cost](#charges) of approximately $0.06 per month per million objects in scope.**
+RVT-S3 addresses these challenges by comparing object properties across bucket pairs, and generating detailed reports on any differences. By validating that the current versions of objects in both locations are identical, RVT-S3 gives you confidence that your replica bucket is a true and complete copy of your source data, and helps verify your replication strategy meets both operational and compliance requirements. **It does this at a very low [cost](#charges) of approximately $0.06 per month per million objects in scope.**
 
-**Object Comparison Logic**: S3-RVT determines object synchronization by comparing both ETag and Last Modified Time between source and destination buckets. Objects are considered synchronized when they have matching object keys, identical ETags, and identical last modified timestamps. Objects with `PENDING` replication status are automatically excluded from reports until replication completes.
+**Object Comparison Logic**: RVT-S3 determines object synchronization by comparing both ETag and Last Modified Time between source and destination buckets. Objects are considered synchronized when they have matching object keys, identical ETags, and identical last modified timestamps. Objects with `PENDING` replication status are automatically excluded from reports until replication completes.
 
-This is complimentary to [S3 Replication metrics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/repl-metrics.html), which provide detailed, real-time monitoring of replication status including bytes and objects pending, and replication latency. S3-RVT is not intended for real-time monitoring, as it relies on daily [S3 Inventory reports](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
+This is complimentary to [S3 Replication metrics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/repl-metrics.html), which provide detailed, real-time monitoring of replication status including bytes and objects pending, and replication latency. RVT-S3 is not intended for real-time monitoring, as it relies on daily [S3 Inventory reports](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
 **Remediation is out of scope**. For more details, see [Remediating Mismatches](#remediating-mismatches).
 
@@ -41,7 +41,7 @@ This is complimentary to [S3 Replication metrics](https://docs.aws.amazon.com/Am
 
 ## Deployment Architecture
 
-S3-RVT enables three primary topologies with its modular design. Separating deployments for source, destination and monitoring allows replication within or across accounts and regions. Monitoring can be within the same account and region as the source or destination, or completely separated.
+RVT-S3 enables three primary topologies with its modular design. Separating deployments for source, destination and monitoring allows replication within or across accounts and regions. Monitoring can be within the same account and region as the source or destination, or completely separated.
 
 #### Possible architectures:
 
@@ -107,7 +107,7 @@ In either case, the detailed list (in CSV format) is available for review. For d
 
 ## Deployment Guide
 
-S3-RVT has a modular deployment model, as discussed above. To accommodate separation of source, destination and monitoring across accounts and regions, it consists of four deployment steps and three CloudFormation templates. Adjust the account and region for each step as appropriate for your infrastruture.
+RVT-S3 has a modular deployment model, as discussed above. To accommodate separation of source, destination and monitoring across accounts and regions, it consists of four deployment steps and three CloudFormation templates. Adjust the account and region for each step as appropriate for your infrastruture.
 
 ### Prerequisites
 - Source Amazon S3 bucket
@@ -319,7 +319,7 @@ The 'bypass buckets' are where the daily S3 Inventory reports are written. As th
 
 ### 🎉 Deployment Complete!
 
-You have successfully deployed the S3 Replication Validation Tool (RVT). 
+You have successfully deployed the Replication Validation Tool for S3(RVT-S3). 
 
 **What happens next:**
 - You'll receive your first validation report within 48 hours
@@ -540,7 +540,7 @@ The RVT tool automatically publishes metrics to Amazon CloudWatch for monitoring
 - Monitor bucket synchronization trends
 
 
-## S3-RVT Reporting Behaviour
+## RVT-S3 Reporting Behaviour
 
 This tool has been designed to minimize false positives, and not report mismatches which could be transient due to replication latency. For the full logic of what is reported, expand the following section.
 
@@ -665,7 +665,7 @@ These costs can be expected to scale approximately linearly with object count. A
 
 ## Cleaning Up
 
-To remove the S3-RVT solution from your environment:
+To remove the RVT-S3 solution from your environment:
 
 1. **Empty S3 buckets**: Empty the **centralized inventory** bucket (Account C) and both **bypass** buckets (Account A and B). You can find the bucket names in the CloudFormation stack outputs.
 
