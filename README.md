@@ -535,9 +535,8 @@ The RVT tool automatically publishes metrics to Amazon CloudWatch for monitoring
 
 **Use Cases:**
 - Create CloudWatch alarms for mismatch thresholds
-- Build dashboards to track replication health over time
+- Build dashboards to track replica consistency over time
 - Set up automated responses to validation failures
-- Monitor bucket synchronization trends
 
 
 ## RVT-S3 Reporting Behaviour
